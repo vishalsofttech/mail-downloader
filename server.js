@@ -1,96 +1,328 @@
-const Pop3Command = require('node-pop3');
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config();
+const Pop3Command = require("node-pop3");
+const fs = require("fs");
+const path = require("path");
+require("dotenv").config();
 
-// Configuration
+// ======================================================
+// CONFIG
+// ======================================================
+
 const user = process.env.REDIFFMAIL_USERNAME;
 const password = process.env.REDIFFMAIL_PASSWORD;
 const host = process.env.REDIFFMAIL_HOST;
 const port = parseInt(process.env.REDIFFMAIL_PORT, 10);
-const tls = process.env.REDIFFMAIL_TLS === 'true';
-const timeout = 120000; // 2 minutes timeout to prevent premature drops
+const tls = process.env.REDIFFMAIL_TLS === "true";
+
+const timeout = 120000;
+const SAVE_INTERVAL = 100;
+
+// ======================================================
+// GLOBAL STATE
+// ======================================================
+
+let uidls = [];
+
+let downloadedCount = 0;
+let skippedCount = 0;
+let failedCount = 0;
+
+let lastProcessedUID = null;
+let lastProcessedMsgNum = null;
+
+let targetDir;
+let metadataFile;
+let progressFile;
+let failedFile;
+let uidFile;
+
+let downloadedUIDs = new Set();
+
+// ======================================================
+// HELPERS
+// ======================================================
+
+async function appendLog(message) {
+    const line = `[${new Date().toISOString()}] ${message}\n`;
+
+    await fs.promises.appendFile(progressFile, line);
+}
+
+async function logFailure(uid, error) {
+    await fs.promises.appendFile(
+        failedFile,
+        `[${new Date().toISOString()}] ${uid} | ${error}\n`
+    );
+}
+
+async function saveMetadata() {
+    try {
+        const metadata = {
+            updatedAt: new Date().toISOString(),
+            totalMessages: uidls.length,
+            downloaded: downloadedCount,
+            skipped: skippedCount,
+            failed: failedCount,
+            remaining:
+                uidls.length -
+                downloadedCount -
+                skippedCount -
+                failedCount,
+            lastProcessedUID,
+            lastProcessedMsgNum,
+        };
+
+        const tempFile = metadataFile + ".tmp";
+
+        await fs.promises.writeFile(
+            tempFile,
+            JSON.stringify(metadata, null, 2)
+        );
+
+        await fs.promises.rename(tempFile, metadataFile);
+    } catch (err) {
+        console.error("Failed saving metadata:", err.message);
+    }
+}
+
+async function saveUID(uid) {
+    await fs.promises.appendFile(uidFile, uid + "\n");
+}
+
+function loadDownloadedUIDs() {
+    try {
+        if (!fs.existsSync(uidFile)) {
+            return new Set();
+        }
+
+        const content = fs.readFileSync(uidFile, "utf8");
+
+        return new Set(
+            content
+                .split("\n")
+                .map((v) => v.trim())
+                .filter(Boolean)
+        );
+    } catch (err) {
+        console.error("Unable to load UID file:", err.message);
+        return new Set();
+    }
+}
+
+function safeFilename(uid) {
+    return uid.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function printProgress() {
+    const processed =
+        downloadedCount +
+        skippedCount +
+        failedCount;
+
+    const remaining =
+        uidls.length - processed;
+
+    process.stdout.write(
+        `\rDownloaded: ${downloadedCount} | Skipped: ${skippedCount} | Failed: ${failedCount} | Remaining: ${remaining}      `
+    );
+}
+
+// ======================================================
+// SHUTDOWN HANDLER
+// ======================================================
+
+async function shutdown(signal) {
+    console.log(`\n\nReceived ${signal}`);
+    await saveMetadata();
+    process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+process.on("uncaughtException", async (err) => {
+    console.error("\nUncaught Exception:", err);
+    await saveMetadata();
+    process.exit(1);
+});
+
+process.on("unhandledRejection", async (err) => {
+    console.error("\nUnhandled Rejection:", err);
+    await saveMetadata();
+    process.exit(1);
+});
+
+// ======================================================
+// MAIN
+// ======================================================
 
 async function downloadMails() {
-    console.log(`Starting email download for ${user}...`);
-
-    // Extract domain for folder structure
-    const parts = user.split('@');
-    if (parts.length !== 2) {
-        console.error("Error: Invalid email format in REDIFFMAIL_USERNAME");
-        process.exit(1);
-    }
-    const domain = parts[1];
-
-    // Create target directory: domain/user
-    const targetDir = path.join(__dirname, domain, user);
-    await fs.promises.mkdir(targetDir, { recursive: true });
-    console.log(`Target directory initialized: ${targetDir}`);
-
-    const pop3 = new Pop3Command({ user, password, host, port, tls, timeout });
-
     try {
-        console.log("Connecting and fetching message list (UIDL)...");
-        const uidls = await pop3.UIDL();
-        console.log(`Total messages on server: ${uidls.length}`);
+        console.log(`Starting POP3 download for ${user}`);
 
-        let downloadedCount = 0;
-        let skippedCount = 0;
+        const parts = user.split("@");
 
-        // Process sequentially to keep memory usage low
+        if (parts.length !== 2) {
+            throw new Error(
+                "Invalid REDIFFMAIL_USERNAME format"
+            );
+        }
+
+        const domain = parts[1];
+
+        targetDir = path.join(
+            __dirname,
+            domain,
+            user
+        );
+
+        await fs.promises.mkdir(targetDir, {
+            recursive: true,
+        });
+
+        metadataFile = path.join(
+            targetDir,
+            "metadata.json"
+        );
+
+        progressFile = path.join(
+            targetDir,
+            "progress.log"
+        );
+
+        failedFile = path.join(
+            targetDir,
+            "failed.txt"
+        );
+
+        uidFile = path.join(
+            targetDir,
+            "downloaded_uids.txt"
+        );
+
+        downloadedUIDs = loadDownloadedUIDs();
+
+        console.log(
+            `Already downloaded: ${downloadedUIDs.size}`
+        );
+
+        const pop3 = new Pop3Command({
+            user,
+            password,
+            host,
+            port,
+            tls,
+            timeout,
+        });
+
+        console.log("Fetching UIDL list...");
+
+        uidls = await pop3.UIDL();
+
+        console.log(
+            `Total messages on server: ${uidls.length}`
+        );
+
+        const startTime = Date.now();
+
         for (let i = 0; i < uidls.length; i++) {
             const [msgNum, uid] = uidls[i];
 
-            // Clean up the UID string to be a valid filename
-            const safeUid = uid.replace(/[^a-zA-Z0-9.-]/g, '_');
-            const filePath = path.join(targetDir, `${safeUid}.eml`);
+            lastProcessedUID = uid;
+            lastProcessedMsgNum = msgNum;
 
-            try {
-                // Check if file already exists to resume interrupted downloads
-                await fs.promises.access(filePath);
+            if (downloadedUIDs.has(uid)) {
                 skippedCount++;
-
-                // Print periodic progress for skipped items
-                if (skippedCount % 1000 === 0) {
-                    console.log(`... Skipped ${skippedCount} messages (already downloaded).`);
-                }
                 continue;
-            } catch (err) {
-                // File does not exist, proceed to download
             }
 
-            console.log(`[${i + 1}/${uidls.length}] Downloading message ID: ${uid} ...`);
+            const fileName =
+                safeFilename(uid) + ".eml";
+
+            const filePath = path.join(
+                targetDir,
+                fileName
+            );
 
             try {
-                // Fetch the entire raw message string
-                const rawMessage = await pop3.RETR(msgNum);
+                const rawMessage =
+                    await pop3.RETR(msgNum);
 
-                // Save to file asynchronously to keep event loop unblocked
-                await fs.promises.writeFile(filePath, rawMessage, 'utf8');
+                await fs.promises.writeFile(
+                    filePath,
+                    rawMessage,
+                    "utf8"
+                );
+
                 downloadedCount++;
-            } catch (downloadError) {
-                console.error(`Failed to download message ${msgNum} (UID: ${uid}):`, downloadError.message);
-                // We choose to continue to the next email instead of crashing the whole process
-                // This makes it resilient against a single corrupted/bad email
+
+                downloadedUIDs.add(uid);
+
+                await saveUID(uid);
+
+                await appendLog(
+                    `SUCCESS | ${uid}`
+                );
+            } catch (err) {
+                failedCount++;
+
+                console.error(
+                    `\nFailed: ${uid}`,
+                    err.message
+                );
+
+                await appendLog(
+                    `FAILED | ${uid} | ${err.message}`
+                );
+
+                await logFailure(
+                    uid,
+                    err.message
+                );
+            }
+
+            printProgress();
+
+            const processed =
+                downloadedCount +
+                skippedCount +
+                failedCount;
+
+            if (processed % SAVE_INTERVAL === 0) {
+                await saveMetadata();
             }
         }
 
-        console.log(`\n--- Summary ---`);
-        console.log(`Total newly downloaded: ${downloadedCount}`);
-        console.log(`Total skipped (already exist): ${skippedCount}`);
-        console.log(`Total failed: ${uidls.length - downloadedCount - skippedCount}`);
+        await saveMetadata();
 
-    } catch (err) {
-        console.error("\n[!] A fatal error occurred during POP3 operations:", err);
-        console.log("You can safely restart the script; it will resume where it left off.");
-    } finally {
         try {
             await pop3.QUIT();
-            console.log("Cleanly disconnected from server.");
-        } catch (quitErr) {
-            console.log("Connection closed abruptly.");
-        }
+        } catch { }
+
+        const duration =
+            ((Date.now() - startTime) / 1000).toFixed(2);
+
+        console.log("\n\n================================");
+        console.log("DOWNLOAD COMPLETED");
+        console.log("================================");
+        console.log("Total Messages :", uidls.length);
+        console.log("Downloaded     :", downloadedCount);
+        console.log("Skipped        :", skippedCount);
+        console.log("Failed         :", failedCount);
+        console.log("Duration       :", duration, "seconds");
+        console.log("Folder         :", targetDir);
+        console.log("================================");
+    } catch (err) {
+        console.error(
+            "\nFatal Error:",
+            err.message
+        );
+
+        await saveMetadata();
     }
 }
+
+// ======================================================
+// START
+// ======================================================
 
 downloadMails();
